@@ -81,8 +81,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-// Passenger Bind
-const PORT = process.env.PORT || 6446;
-app.listen(PORT, () => {
+// Hostinger injects PORT. PROXY_PORT remains available for local/VPS use.
+const PORT = Number(process.env.PORT || process.env.PROXY_PORT || 6446);
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server active on port ${PORT}`);
 });
