@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -18,19 +19,75 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 
+// ── API Keys ───────────────────────────────────────────────────────
+// KEYS_FILE may be relative to the app working directory or absolute.
+// If the file is missing or empty, two local proxy keys are generated once.
 const KEYS_FILE = process.env.KEYS_FILE || path.join(__dirname, 'api-keys.json');
+let apiKeys = {};
+
+function loadKeys() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      apiKeys = Object.fromEntries(
+        Object.entries(parsed).filter(([, value]) => typeof value === 'string' && value.trim())
+      );
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.warn(`[AUTH] Could not read ${KEYS_FILE}; generating a new key file.`);
+    }
+  }
+
+  if (Object.keys(apiKeys).length === 0) {
+    apiKeys = {
+      admin: 'oc-' + crypto.randomBytes(20).toString('hex'),
+      'user-default': 'oc-' + crypto.randomBytes(20).toString('hex')
+    };
+
+    try {
+      const dir = path.dirname(KEYS_FILE);
+      if (dir && dir !== '.') fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(KEYS_FILE, JSON.stringify(apiKeys, null, 2) + '\n', { mode: 0o600 });
+      console.log(`[AUTH] Generated API keys at ${KEYS_FILE}`);
+    } catch (error) {
+      console.error(`[AUTH] Failed to write ${KEYS_FILE}:`, error?.message || error);
+      throw error;
+    }
+  } else {
+    console.log(`[AUTH] Loaded ${Object.keys(apiKeys).length} API key(s) from ${KEYS_FILE}`);
+  }
+}
+
+loadKeys();
+
+function auth(req) {
+  const header = String(req.headers.authorization || req.headers['x-api-key'] || '');
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : header.trim();
+  if (!token) return null;
+
+  for (const [name, key] of Object.entries(apiKeys)) {
+    if (token === key) return name;
+  }
+  return null;
+}
 
 // Health Check Root
 app.get('/', (req, res) => {
   res.status(200).json({
     status: 'online',
     domain: 'AI.cpxs.ca',
+    auth: 'enabled',
     timestamp: new Date().toISOString()
   });
 });
 
 app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+  res.status(200).json({
+    status: 'ok',
+    auth: 'enabled',
+    keysLoaded: Object.keys(apiKeys).length
+  });
 });
 
 // Models Endpoint
@@ -50,6 +107,13 @@ app.get('/v1/models', (req, res) => {
 
 // Chat Endpoint
 app.post('/v1/chat/completions', async (req, res) => {
+  const user = auth(req);
+  if (!user) {
+    return res.status(401).json({
+      error: { message: 'Invalid API key' }
+    });
+  }
+
   try {
     const { model, messages } = req.body;
 
