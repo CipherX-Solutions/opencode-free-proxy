@@ -24,7 +24,7 @@ app.use(express.json({ limit: '10mb' }));
 // Use an official OpenCode Zen API key from https://opencode.ai.
 const OPENCODE_API_KEY = process.env.OPENCODE_API_KEY?.trim() || '';
 const OPENCODE_BASE_URL = (process.env.OPENCODE_BASE_URL?.trim() || 'https://opencode.ai/zen/v1').replace(/\/+$/, '');
-const DEFAULT_MODEL = process.env.OPENCODE_DEFAULT_MODEL?.trim() || 'ling-3.1-flash-free';
+const DEFAULT_MODEL = process.env.OPENCODE_DEFAULT_MODEL?.trim() || 'minimax-m2.5-free';
 
 // ── Local proxy API keys ───────────────────────────────────────────
 // Prefer KEYS_FILE when supplied. Otherwise keep the historical
