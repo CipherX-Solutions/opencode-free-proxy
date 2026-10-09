@@ -188,8 +188,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 // ── Start ──────────────────────────────────────────────────────────
-// Hostinger injects PORT. PROXY_PORT is retained for VPS/local use.
-const requestedPort = process.env.PORT || process.env.PROXY_PORT || '6446';
+// Hostinger managed Node.js apps expect the application on port 3000.
+// Respect PORT when the platform supplies it, then PROXY_PORT for VPS/local use.
+const requestedPort = process.env.PORT || process.env.PROXY_PORT || '3000';
 const PORT = Number.parseInt(requestedPort, 10);
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
