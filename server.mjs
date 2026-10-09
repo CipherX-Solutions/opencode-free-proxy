@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -19,7 +20,13 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 
-// ── API Keys ───────────────────────────────────────────────────────
+// ── OpenCode Zen ───────────────────────────────────────────────────
+// Use an official OpenCode Zen API key from https://opencode.ai.
+const OPENCODE_API_KEY = process.env.OPENCODE_API_KEY?.trim() || '';
+const OPENCODE_BASE_URL = (process.env.OPENCODE_BASE_URL?.trim() || 'https://opencode.ai/zen/v1').replace(/\/+$/, '');
+const DEFAULT_MODEL = process.env.OPENCODE_DEFAULT_MODEL?.trim() || 'ling-3.1-flash-free';
+
+// ── Local proxy API keys ───────────────────────────────────────────
 // Prefer KEYS_FILE when supplied. Otherwise keep the historical
 // api-keys.json file beside the application. If that location is not
 // writable on managed hosting, fall back to the OS temp directory so a
@@ -61,8 +68,6 @@ function loadKeys() {
     return;
   }
 
-  // Reuse a previously generated fallback file if the app directory is
-  // read-only but the host preserves /tmp for the running instance.
   if (fallbackKeysFile !== primaryKeysFile) {
     const fallbackKeys = readKeys(fallbackKeysFile);
     if (Object.keys(fallbackKeys).length > 0) {
@@ -92,9 +97,6 @@ function loadKeys() {
     activeKeysFile = fallbackKeysFile;
     console.log(`[AUTH] Generated API keys at fallback ${activeKeysFile}`);
   } catch (error) {
-    // Do not crash the web server solely because the filesystem is read-only.
-    // Authentication still works for this process with the generated keys,
-    // although they will be regenerated after a restart.
     activeKeysFile = 'memory-only';
     console.warn(`[AUTH] Could not persist generated keys: ${error?.code || error?.message || error}`);
   }
@@ -113,12 +115,43 @@ function auth(req) {
   return null;
 }
 
+function requireOpenCodeKey(res) {
+  if (OPENCODE_API_KEY) return true;
+
+  res.status(503).json({
+    error: {
+      message: 'OpenCode Zen is not configured. Set OPENCODE_API_KEY in the server environment.',
+      type: 'configuration_error',
+      code: 'opencode_not_configured'
+    }
+  });
+  return false;
+}
+
+async function sendUpstreamResponse(upstream, res, wantsStream = false) {
+  const contentType = upstream.headers.get('content-type');
+  if (contentType) res.setHeader('Content-Type', contentType);
+
+  res.status(upstream.status);
+
+  if (wantsStream && upstream.ok && upstream.body) {
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    Readable.fromWeb(upstream.body).pipe(res);
+    return;
+  }
+
+  const body = Buffer.from(await upstream.arrayBuffer());
+  res.send(body);
+}
+
 // ── Health ─────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
   res.status(200).json({
     status: 'online',
     domain: 'AI.cpxs.ca',
     auth: 'enabled',
+    opencodeConfigured: Boolean(OPENCODE_API_KEY),
     timestamp: new Date().toISOString()
   });
 });
@@ -128,26 +161,40 @@ app.get('/health', (_req, res) => {
     status: 'ok',
     auth: 'enabled',
     keysLoaded: Object.keys(apiKeys).length,
-    keyStorage: activeKeysFile === 'memory-only' ? 'memory' : 'file'
+    keyStorage: activeKeysFile === 'memory-only' ? 'memory' : 'file',
+    opencodeConfigured: Boolean(OPENCODE_API_KEY),
+    upstream: OPENCODE_BASE_URL
   });
 });
 
 // ── Models ─────────────────────────────────────────────────────────
-app.get('/v1/models', (_req, res) => {
-  res.status(200).json({
-    object: 'list',
-    data: [
-      {
-        id: 'deepseek-v4-flash-free',
-        object: 'model',
-        created: 1700000000,
-        owned_by: 'opencode-proxy'
+app.get('/v1/models', async (_req, res) => {
+  if (!requireOpenCodeKey(res)) return;
+
+  try {
+    const upstream = await fetch(`${OPENCODE_BASE_URL}/models`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${OPENCODE_API_KEY}`,
+        Accept: 'application/json'
+      },
+      signal: AbortSignal.timeout(30000)
+    });
+
+    await sendUpstreamResponse(upstream, res, false);
+  } catch (error) {
+    console.error('[OPENCODE] Models request failed:', error?.message || error);
+    res.status(502).json({
+      error: {
+        message: 'Could not reach OpenCode Zen.',
+        type: 'upstream_error',
+        code: 'opencode_unreachable'
       }
-    ]
-  });
+    });
+  }
 });
 
-// ── Chat endpoint ──────────────────────────────────────────────────
+// ── OpenAI-compatible chat endpoint ────────────────────────────────
 app.post('/v1/chat/completions', async (req, res) => {
   const user = auth(req);
   if (!user) {
@@ -156,34 +203,50 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
   }
 
-  try {
-    const { model, messages } = req.body;
+  if (!requireOpenCodeKey(res)) return;
 
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({
-        error: { message: 'Invalid payload: "messages" array required.' }
-      });
-    }
+  const { model, messages, stream } = req.body || {};
 
-    return res.status(200).json({
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: model || 'deepseek-v4-flash-free',
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: 'assistant',
-            content: 'Hello! Your Hostinger Node.js proxy at AI.cpxs.ca is fully operational.'
-          },
-          finish_reason: 'stop'
-        }
-      ]
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({
+      error: { message: 'Invalid payload: "messages" array required.' }
     });
+  }
+
+  const requestBody = {
+    ...req.body,
+    model: model || DEFAULT_MODEL,
+    messages,
+    stream: Boolean(stream)
+  };
+
+  try {
+    console.log(`[OPENCODE] ${user} -> ${requestBody.model} (${requestBody.stream ? 'stream' : 'sync'})`);
+
+    const upstream = await fetch(`${OPENCODE_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENCODE_API_KEY}`,
+        'Content-Type': 'application/json',
+        Accept: requestBody.stream ? 'text/event-stream' : 'application/json'
+      },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(120000)
+    });
+
+    console.log(`[OPENCODE] ${requestBody.model} <- HTTP ${upstream.status}`);
+    await sendUpstreamResponse(upstream, res, requestBody.stream);
   } catch (error) {
-    console.error('Proxy Error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+    const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+    console.error('[OPENCODE] Chat request failed:', error?.message || error);
+
+    res.status(isTimeout ? 504 : 502).json({
+      error: {
+        message: isTimeout ? 'OpenCode Zen request timed out.' : 'Could not reach OpenCode Zen.',
+        type: isTimeout ? 'timeout_error' : 'upstream_error',
+        code: isTimeout ? 'opencode_timeout' : 'opencode_unreachable'
+      }
+    });
   }
 });
 
@@ -201,6 +264,7 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`[STARTUP] Server active on 0.0.0.0:${PORT}`);
   console.log(`[STARTUP] Key storage: ${activeKeysFile}`);
+  console.log(`[STARTUP] OpenCode Zen configured: ${Boolean(OPENCODE_API_KEY)}`);
 });
 
 server.on('error', (error) => {
